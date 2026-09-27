@@ -1,4 +1,4 @@
-"""Regression coverage for the template's Hermes v2026.9.21 integration.
+"""Regression coverage from v2026.9.21, carried into the v2026.9.24 upgrade.
 
 Uses only stdlib unittest so the same file can run on the host and inside the
 release image without installing the upstream development/test extras.
@@ -34,6 +34,14 @@ def load_server(home: Path):
         raise RuntimeError("could not load server.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if importlib.util.find_spec("hermes_cli") is None:
+        # Router/config merge tests also run outside the Docker image, where
+        # the upstream Hermes package is not installed. Exercise the merge
+        # logic with a local persistence seam; Docker runs the real upstream
+        # atomic, comment-preserving writer.
+        module._write_config_atomic = lambda path, data: path.write_text(
+            yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+        )
     return module
 
 
@@ -87,7 +95,7 @@ class BackupExclusionTests(UpgradeServerMixin, unittest.TestCase):
 
         self.assertEqual(
             self.server._live_db_names(),
-            {Path(rel).name for rel in included},
+            included,
         )
 
     def test_kept_cache_subdirs_are_positive_allowlist(self):
@@ -515,7 +523,7 @@ class RouterProviderUiTests(unittest.TestCase):
 class ReleasePinTests(unittest.TestCase):
     def test_dockerfile_pins_target_release(self):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-        self.assertIn("ARG HERMES_REF=v2026.9.21", dockerfile)
+        self.assertIn("ARG HERMES_REF=v2026.9.24", dockerfile)
 
     def test_dockerfile_pins_fixed_sqlite_runtime(self):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")

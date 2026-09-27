@@ -632,6 +632,18 @@
   code { font-family: var(--font-mono); color: var(--accent); }
   .field-gap { margin-top: 12px; }
 
+  .hindsight-upgrade-notice {
+    background: rgba(210, 153, 34, 0.08);
+    border: 1px solid rgba(210, 153, 34, 0.4);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    line-height: 1.55;
+  }
+  .hindsight-upgrade-notice strong { color: var(--yellow); }
+  .hindsight-upgrade-notice p { margin-top: 5px; font-size: 13px; }
+  .hindsight-upgrade-notice a { color: var(--accent2); text-underline-offset: 2px; }
+
   /* ── Guide steps ─────────────────────────────────── */
   .guide-section {
     margin-bottom: 28px;
@@ -1127,6 +1139,11 @@
       </div>
       <div class="panel-body">
 
+        <div class="hindsight-upgrade-notice" x-show="status.hindsight_configured === true" role="note">
+          <strong>Check Hindsight memory after this upgrade</strong>
+          <p>At least one profile uses Hindsight. Hermes v2026.9.24 now loads it from the plugin catalog; this update does not delete your stored memories. Check <a href="/?force=1">Hermes Dashboard</a> &rarr; Memory for each affected profile. If Hindsight is missing, install it from the Hermes plugin catalog for that profile, then test recall and retention.</p>
+        </div>
+
         <div style="background:rgba(98,114,255,0.06);border:1px solid rgba(98,114,255,0.2);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:13px;color:var(--text-dim);">
           New to Hermes? Head over to the <a href="#" @click.prevent="page='guide'" style="color:var(--accent2);text-decoration:none;font-weight:500;">How to Setup</a> section for a step-by-step guide on getting started.
         </div>
@@ -1536,6 +1553,24 @@
           <button class="btn success" @click="resumeBot()">▶ Resume</button>
         </div>
 
+        <div class="stat-card" style="margin-bottom:16px;padding:12px 14px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+            <div class="stat-label" style="margin-bottom:0;color:var(--text);">Default Profile Storage</div>
+            <div class="stat-value" style="font-size:14px;"
+                 :class="{green: status.storage?.status==='ok', red: status.storage?.status==='degraded', yellow: status.storage?.status==='unknown'}"
+                 x-text="status.storage?.status==='ok' ? 'Check OK' : status.storage?.status==='degraded' ? 'Needs attention' : 'Unknown'"></div>
+          </div>
+          <div x-show="status.storage?.status==='degraded'" role="alert"
+               style="font-size:12px;color:var(--text);margin-top:8px;">
+            <span x-show="status.storage?.reason==='corrupt'">Hermes reports that state.db is corrupt. Stop the gateway before recovering or restoring a known-good backup; chat history and replies may fail.</span>
+            <span x-show="status.storage?.reason!=='corrupt'">Hermes could not read state.db reliably. Check Logs before relying on chat history or replies.</span>
+          </div>
+          <div x-show="status.storage?.status==='unknown'"
+               style="font-size:12px;color:var(--text);margin-top:8px;">
+            The Hermes dashboard did not return a storage result. Database health is unconfirmed.
+          </div>
+        </div>
+
         <div class="stat-grid">
           <div class="stat-card">
             <div class="stat-label">Gateway State</div>
@@ -1633,6 +1668,7 @@
         </template>
 
         <div class="section-label" style="margin-top:20px;">Approved Users</div>
+        <div class="hint" style="margin-bottom:10px;">Revoke removes the pairing approval. Other Hermes or Railway access rules may still allow this user; remove those separately.</div>
         <div class="empty-state" x-show="approved.length===0">No approved users yet.</div>
         <div class="card" style="padding:0;overflow:hidden;" x-show="approved.length>0">
           <table class="data-table">
@@ -1676,8 +1712,10 @@
         <div class="section-label">Download Backup</div>
         <div class="card" style="padding:16px;">
           <p style="font-size:13px;color:var(--text-dim);line-height:1.6;margin:0 0 12px;">
-            Downloads a full snapshot of this deployment — config, provider keys, channel tokens,
-            approved users, chat history, memories, skills, and cron jobs — as a single .zip.
+            Downloads Hermes-home data — config, provider keys, channel tokens,
+            approved users, chat history, skills, cron jobs, and supported provider files — as a single .zip.
+            Hindsight cloud/external memory and embedded PostgreSQL files under /data/.pg0 are not included;
+            back up the external service and the full /data volume separately before relying on this zip for a restore.
             Upload it via Restore below on another deployment to reproduce this bot there.
             <strong style="color:var(--text);">The file is not encrypted</strong> — it contains
             your API keys and bot tokens in plain text, so store it somewhere safe.
@@ -1852,7 +1890,8 @@
         <div style="background:rgba(98,114,255,0.06);border:1px solid rgba(98,114,255,0.2);border-radius:8px;padding:12px 15px;margin-bottom:20px;font-size:13px;color:var(--text-dim);line-height:1.6;">
           <div style="margin-bottom:8px;">
             <code>main</code> always ships the <strong style="color:var(--text);">latest</strong> release — that is what you get by default.
-            To stay on, or roll back to, a particular Hermes version, point your Railway service at that release's branch and redeploy.
+            To stay on a particular Hermes version, point your Railway service at that release's branch and redeploy.
+            Reverting the branch does not undo changes already made to the persistent volume; restore a pre-upgrade backup if its data must also be rolled back.
           </div>
           <div>
             Release branches are named <code>release/&lt;hermes-version&gt;/&lt;n&gt;</code>.
@@ -1860,6 +1899,44 @@
             template-only fixes and improvements on top of it — the Hermes version never changes within a series.
             <strong style="color:var(--text);">Pick the highest number</strong> for the Hermes version you want; each branch stays put once published.
           </div>
+        </div>
+
+        <div class="changelog-entry major">
+          <div class="changelog-date">September 27, 2026</div>
+          <div class="changelog-meta">
+            <span class="meta-box">
+              <span class="meta-label">Git branch</span>
+              <code>release/v2026.9.24/1</code>
+            </span>
+            <span class="meta-box version">
+              <span class="meta-label">Hermes compatible version</span>
+              <code>v2026.9.24</code>
+            </span>
+          </div>
+
+          <div class="changelog-group">Hermes update</div>
+          <ul class="changelog-list">
+            <li>Updated <strong>Hermes Agent to v2026.9.24</strong> (from v2026.9.21). Browser Chat now lets you choose a workspace for a new session.</li>
+            <li><strong>Hindsight memory is now a catalog plugin.</strong> This update does not delete your stored memory bank or saved settings. If Hindsight is configured, Setup shows a notice to check each affected profile. Install a missing plugin from the Hermes catalog for that profile, then test recall and retention. Embedded mode remains unavailable in this default root-running image.</li>
+            <li><strong>Back up Hindsight data separately for rollback or cloning.</strong> The Hermes zip does not include external memory or embedded PostgreSQL under <code>/data/.pg0</code>; this existing limit is now explained on the Backup page.</li>
+            <li><strong>Bot Screen is not available in this Railway image.</strong> Browser Chat and its new workspace picker work here; the Desktop screen viewer needs a separate runtime and proxy integration.</li>
+            <li><strong>Old named-profile replies may need attention.</strong> Hermes now records new outgoing replies in the root ledger. Startup warns and continues when it finds an old unfinished reply; a sender can ask again, but that starts a new turn and may repeat tool actions. An unreadable ledger still stops the upgrade.</li>
+            <li><strong>Use full IDs in hand-written allowlists.</strong> A short entry like <code>alice</code> no longer grants access to <code>alice@example.com</code>; users approved in this panel already have full IDs.</li>
+          </ul>
+
+          <div class="changelog-group">Changes to support upstream updates</div>
+          <ul class="changelog-list">
+            <li><strong>Existing configs run through Hermes' backed-up migration before startup, including named profiles.</strong> Older profile instructions and the template's model setting are protected if migration fails. Check warnings and confirm that an old MCP server marked disabled now stays off.</li>
+            <li><strong>Restore refuses an incomplete safety backup.</strong> Databases with the same name in different profiles are checked separately before existing data is changed.</li>
+          </ul>
+
+          <div class="changelog-group">Bug fixes</div>
+          <ul class="changelog-list">
+            <li><strong>Unreadable config is no longer replaced.</strong> Save, gateway start and xAI OAuth show an error so you can repair the original file.</li>
+            <li><strong>Pairing approvals survive legacy folder aliases and interrupted writes.</strong> Revoke warns when another access rule may still grant access instead of claiming the user was blocked.</li>
+            <li><strong>Status now flags detected chat-history storage problems; Dashboard Stop stays stopped, and planned Restarts no longer count as crashes.</strong></li>
+            <li><strong>Runtime setup warnings now explain what survives redeploy.</strong> Hermes packages on <code>/data</code> persist, while some provider-specific installers may need to be run again.</li>
+          </ul>
         </div>
 
         <div class="changelog-entry major">
@@ -2603,8 +2680,13 @@ function app() {
     },
     async revoke(platform, user_id) {
       if (!confirm('Revoke access for this user?')) return;
-      await fetch('/setup/api/pairing/revoke', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({platform,user_id}) });
-      this.notify('Revoked', true); await this.loadPairing();
+      try {
+        const r = await fetch('/setup/api/pairing/revoke', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({platform,user_id}) });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok && d.ok) this.notify(d.warning || 'Pairing approval removed', true);
+        else this.notify(d.error || 'Could not revoke access', false);
+        await this.loadPairing();
+      } catch (e) { this.notify('Could not revoke access: ' + e.message, false); }
     },
 
     async downloadBackup() {

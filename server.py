@@ -35,6 +35,7 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import tempfile
 import time
 import zipfile
@@ -144,26 +145,32 @@ def _consolidate_pairing_dirs() -> None:
     consolidated = Path(HERMES_HOME) / "platforms" / "pairing"
     try:
         alternate = legacy if active.resolve() == consolidated.resolve() else consolidated
-    except OSError:
+        # An old volume may have pairing/ symlinked to platforms/pairing/.
+        # Both spellings then refer to the same files: merging followed by
+        # unlinking the "alternate" would delete live approvals.
+        if alternate.resolve() == active.resolve():
+            return
+    except (OSError, RuntimeError):
         return
     if not alternate.is_dir():
         return
     for src in sorted(alternate.glob("*.json")):
         if not src.is_file():
             continue
-        stale = _pjson(src)
+        try:
+            stale = _read_pairing_json(src)
+        except (OSError, ValueError) as e:
+            print(f"[pairing] keeping unreadable alternate {src}: {e}", flush=True)
+            continue
         if not stale:
-            # Empty, or unreadable (_pjson swallows a parse error as {}). Either
-            # way there is nothing to merge — and we do NOT delete it, because a
-            # corrupt file may still be recoverable by hand. An empty leftover
-            # is inert: hermes' own merge skips it too.
+            # An empty leftover is inert: hermes' own merge skips it too.
             continue
         dest = active / src.name
         merged = dict(stale)
-        merged.update(_pjson(dest))   # live entries win
         try:
+            merged.update(_read_pairing_json(dest))   # live entries win
             _wjson(dest, merged)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             print(f"[pairing] consolidate failed for {src.name}: {e}", flush=True)
             continue          # leave the source intact — never drop the only copy
         src.unlink(missing_ok=True)
@@ -501,6 +508,91 @@ def read_env(path: Path) -> dict[str, str]:
     return out
 
 
+def _read_config_for_write(path: Path) -> dict:
+    """Read the whole existing config, refusing to replace a damaged file.
+
+    Hermes v2026.9.24 makes every native config writer fail closed. The admin
+    panel and xAI OAuth write this same file, so they must reject a bad read
+    before changing either config.yaml or its companion .env/auth.json files.
+    """
+    import yaml
+
+    try:
+        mode = path.lstat().st_mode
+        if not stat.S_ISREG(mode):
+            raise ValueError("config.yaml is not a regular file; existing settings were left untouched")
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise ValueError("Could not read config.yaml; existing settings were left untouched") from exc
+    try:
+        loaded = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
+        raise ValueError("config.yaml is invalid YAML; existing settings were left untouched") from exc
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ValueError("config.yaml must contain a mapping; existing settings were left untouched")
+    return loaded
+
+
+def _write_config_atomic(path: Path, data: dict) -> None:
+    """Use the pinned Hermes writer for atomic, comment-preserving config saves."""
+    from hermes_cli.config import atomic_config_write
+
+    atomic_config_write(path, data)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Replace a credential file without exposing a truncated intermediate file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        stream = os.fdopen(fd, "w", encoding="utf-8")
+        fd = -1  # the stream owns and closes it from here on
+        with stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        Path(tmp_name).unlink(missing_ok=True)
+
+
+def _file_snapshot(path: Path) -> tuple[bytes, int] | None:
+    """Keep exact pre-save bytes and mode for a multi-file credential update."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{path.name} is not a regular file")
+        return stream.read(), stat.S_IMODE(info.st_mode)
+
+
+def _restore_file_snapshot(path: Path, snapshot: tuple[bytes, int] | None) -> None:
+    if snapshot is None:
+        path.unlink(missing_ok=True)
+        return
+    contents, mode = snapshot
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.restore.", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        Path(tmp_name).unlink(missing_ok=True)
+
+
 def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> None:
     """Write config.yaml — deep-merge template defaults with any existing user/cron-managed sections.
 
@@ -516,22 +608,9 @@ def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> Non
     on top, and write the merged result. Unknown top-level keys (``mcp_servers``,
     custom skill config, etc.) are preserved verbatim.
     """
-    import yaml  # hermes-agent already pulls pyyaml; deferred import keeps cold start light
-
     model = data.get("LLM_MODEL", "")
     config_path = Path(HERMES_HOME) / "config.yaml"
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-
-    existing: dict = {}
-    if config_path.exists():
-        try:
-            with config_path.open() as f:
-                loaded = yaml.safe_load(f)
-            if isinstance(loaded, dict):
-                existing = loaded
-        except (yaml.YAMLError, OSError):
-            # Treat unparseable as absent — we'll overwrite with template defaults.
-            existing = {}
+    existing = _read_config_for_write(config_path)
 
     merged = dict(existing)
 
@@ -732,8 +811,7 @@ def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> Non
     else:
         merged.pop("custom_providers", None)
 
-    with config_path.open("w") as f:
-        yaml.safe_dump(merged, f, sort_keys=False, default_flow_style=False)
+    _write_config_atomic(config_path, merged)
 
 
 # ── Hermes dashboard auth (so MCP OAuth redirects resolve to the real host) ──
@@ -1045,7 +1123,7 @@ def write_env(path: Path, data: dict[str, str]) -> None:
         lines.extend(sorted(grouped["other"]))
         lines.append("")
 
-    path.write_text("\n".join(lines))
+    _atomic_write_text(path, "\n".join(lines))
 
 
 # ── xAI Grok SuperGrok OAuth (Device Code — RFC 8628) ───────────────────────
@@ -1077,16 +1155,17 @@ def _has_xai_oauth_tokens() -> bool:
 def _save_xai_auth_json(tokens: dict) -> None:
     """Write xAI OAuth tokens to auth.json in hermes's expected format."""
     auth_path = Path(HERMES_HOME) / "auth.json"
-    existing: dict = {}
-    if auth_path.exists():
-        try:
-            existing = json.loads(auth_path.read_text())
-        except Exception:
-            pass
-    if not isinstance(existing, dict):
+    try:
+        existing = json.loads(auth_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         existing = {}
-
+    except (OSError, ValueError) as exc:
+        raise ValueError("Could not read auth.json; existing credentials were left untouched") from exc
+    if not isinstance(existing, dict):
+        raise ValueError("auth.json must contain an object; existing credentials were left untouched")
     providers = existing.setdefault("providers", {})
+    if not isinstance(providers, dict):
+        raise ValueError("auth.json providers must be an object; existing credentials were left untouched")
     providers["xai-oauth"] = {
         "tokens": tokens,
         "auth_mode": "oauth_device",
@@ -1101,27 +1180,13 @@ def _save_xai_auth_json(tokens: dict) -> None:
     existing["version"] = 2
     existing["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    auth_path.write_text(json.dumps(existing, indent=2) + "\n")
-    try:
-        auth_path.chmod(0o600)
-    except Exception:
-        pass
+    _atomic_write_text(auth_path, json.dumps(existing, indent=2) + "\n")
 
 
-def _apply_xai_oauth_config(model: str) -> None:
+def _apply_xai_oauth_config(model: str, *, on_config_saved=None) -> None:
     """Write config.yaml with provider=xai-oauth and the chosen model."""
-    import yaml
     config_path = Path(HERMES_HOME) / "config.yaml"
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    existing: dict = {}
-    if config_path.exists():
-        try:
-            with config_path.open() as f:
-                loaded = yaml.safe_load(f)
-            if isinstance(loaded, dict):
-                existing = loaded
-        except Exception:
-            pass
+    existing = _read_config_for_write(config_path)
 
     merged = dict(existing)
     merged_model = dict(merged.get("model") if isinstance(merged.get("model"), dict) else {})
@@ -1141,8 +1206,9 @@ def _apply_xai_oauth_config(model: str) -> None:
     merged["agent"] = merged_agent
     merged["data_dir"] = HERMES_HOME
 
-    with config_path.open("w") as f:
-        yaml.safe_dump(merged, f, sort_keys=False, default_flow_style=False)
+    _write_config_atomic(config_path, merged)
+    if on_config_saved is not None:
+        on_config_saved()
 
     # Persist LLM_MODEL and track the per-provider model so the setup UI can
     # display it alongside the xAI entry in the "Configured Providers" list.
@@ -1153,11 +1219,55 @@ def _apply_xai_oauth_config(model: str) -> None:
         write_env(ENV_FILE, existing_env)
 
 
+def _save_xai_oauth_bundle(tokens: dict, model: str) -> None:
+    """Save tokens, config and env together, restoring old files on failure.
+
+    The caller holds cfg_lock so the setup panel cannot interleave a save.
+    This is a best-effort filesystem transaction: if rollback itself fails,
+    surface that explicitly instead of claiming the old state was restored.
+    """
+    config_path = Path(HERMES_HOME) / "config.yaml"
+    auth_path = Path(HERMES_HOME) / "auth.json"
+    _read_config_for_write(config_path)
+    paths = (auth_path, config_path, ENV_FILE)
+    snapshots = {path: _file_snapshot(path) for path in paths}
+    written: dict[Path, tuple[bytes, int] | None] = {}
+
+    def mark_config_saved() -> None:
+        written[config_path] = None
+        written[config_path] = _file_snapshot(config_path)
+
+    try:
+        _save_xai_auth_json(tokens)
+        written[auth_path] = None
+        written[auth_path] = _file_snapshot(auth_path)
+        _apply_xai_oauth_config(model, on_config_saved=mark_config_saved)
+    except Exception as exc:
+        failures = []
+        for path in reversed(paths):
+            if path not in written:
+                continue
+            try:
+                if written[path] is None:
+                    failures.append(f"{path.name} could not be verified after write; left untouched")
+                elif _file_snapshot(path) == written[path]:
+                    _restore_file_snapshot(path, snapshots[path])
+                else:
+                    failures.append(f"{path.name} changed concurrently; left untouched")
+            except (OSError, ValueError) as restore_exc:
+                failures.append(f"{path.name}: {restore_exc}")
+        if failures:
+            raise RuntimeError(f"{exc}; rollback incomplete ({'; '.join(failures)})") from exc
+        raise
+
+
 async def _poll_xai_device_auth(state: dict) -> None:
     """Background task: poll xAI token endpoint until authorized or expired."""
     client = get_http_client()
     while time.time() < state["expires_at"]:
         await asyncio.sleep(state["interval"])
+        if state is not _xai_oauth_state:
+            return
         try:
             resp = await client.post(
                 _XAI_TOKEN_URL,
@@ -1180,9 +1290,21 @@ async def _poll_xai_device_auth(state: dict) -> None:
                 state["status"] = "error"
                 state["error"] = "Invalid token response from xAI"
                 return
-            _save_xai_auth_json(tokens)
-            _apply_xai_oauth_config(state.get("model", ""))
-            state["status"] = "authorized"
+            try:
+                # An invalid existing config must not be replaced after we have
+                # already changed auth.json or .env for the new credential.
+                async with cfg_lock:
+                    # A newer auth attempt or Disconnect supersedes this poll.
+                    # Check under the same lock used by credential writes.
+                    if state is not _xai_oauth_state:
+                        return
+                    _save_xai_oauth_bundle(tokens, state.get("model", ""))
+                    state["status"] = "authorized"
+            except Exception as exc:
+                state["status"] = "error"
+                state["error"] = f"Could not save xAI authentication: {exc}"
+                print(f"[xai-oauth] save failed: {exc!r}", flush=True)
+                return
             print("[xai-oauth] authorized — restarting gateway", flush=True)
             asyncio.create_task(gw.restart())
             return
@@ -1212,19 +1334,44 @@ async def api_oauth_xai_delete(request: Request) -> Response:
     if err := guard(request):
         return err
     auth_path = Path(HERMES_HOME) / "auth.json"
-    if auth_path.exists():
+    async with cfg_lock:
         try:
-            data = json.loads(auth_path.read_text(encoding="utf-8"))
-            data.get("providers", {}).pop("xai-oauth", None)
-            if data.get("active_provider") == "xai-oauth":
-                data.pop("active_provider", None)
-            auth_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        except Exception:
-            pass
-    env = read_env(ENV_FILE)
-    env.pop("_MODEL_XAI_OAUTH", None)
-    write_env(ENV_FILE, env)
-    _xai_oauth_state = None
+            auth_before = _file_snapshot(auth_path)
+            _file_snapshot(ENV_FILE)  # refuse a linked or non-regular env file
+        except (OSError, ValueError) as exc:
+            return JSONResponse({"error": f"Could not inspect xAI credentials safely: {exc}"}, status_code=500)
+        auth_written = None
+        auth_save_done = False
+        try:
+            if auth_before is not None:
+                data = json.loads(auth_before[0].decode("utf-8"))
+                if not isinstance(data, dict) or not isinstance(data.get("providers", {}), dict):
+                    raise ValueError("auth.json must contain provider objects")
+                data.get("providers", {}).pop("xai-oauth", None)
+                if data.get("active_provider") == "xai-oauth":
+                    data.pop("active_provider", None)
+                _atomic_write_text(auth_path, json.dumps(data, indent=2) + "\n")
+                auth_save_done = True
+                auth_written = _file_snapshot(auth_path)
+            env = read_env(ENV_FILE)
+            env.pop("_MODEL_XAI_OAUTH", None)
+            write_env(ENV_FILE, env)
+        except (OSError, ValueError) as exc:
+            restore_errors = []
+            if auth_save_done and auth_written is None:
+                restore_errors.append("auth.json could not be verified after write; left untouched")
+            elif auth_written is not None:
+                try:
+                    if _file_snapshot(auth_path) == auth_written:
+                        _restore_file_snapshot(auth_path, auth_before)
+                    else:
+                        restore_errors.append("auth.json changed concurrently; left untouched")
+                except (OSError, ValueError) as restore_exc:
+                    restore_errors.append(f"auth.json: {restore_exc}")
+            if restore_errors:
+                return JSONResponse({"error": f"Could not disconnect xAI safely: {exc}; rollback incomplete ({'; '.join(restore_errors)})"}, status_code=500)
+            return JSONResponse({"error": f"Could not disconnect xAI safely: {exc}"}, status_code=500)
+        _xai_oauth_state = None
     return JSONResponse({"ok": True})
 
 
@@ -1261,7 +1408,7 @@ async def api_oauth_xai_start(request: Request) -> Response:
     except Exception:
         return JSONResponse({"error": "Invalid response from xAI"}, status_code=502)
 
-    _xai_oauth_state = {
+    state = {
         "device_code": data["device_code"],
         "user_code": data["user_code"],
         "verification_uri": data.get("verification_uri_complete") or data["verification_uri"],
@@ -1270,11 +1417,13 @@ async def api_oauth_xai_start(request: Request) -> Response:
         "status": "pending",
         "model": model,
     }
-    asyncio.create_task(_poll_xai_device_auth(_xai_oauth_state))
+    async with cfg_lock:
+        _xai_oauth_state = state
+    asyncio.create_task(_poll_xai_device_auth(state))
 
     return JSONResponse({
         "user_code": data["user_code"],
-        "verification_uri": _xai_oauth_state["verification_uri"],
+        "verification_uri": state["verification_uri"],
         "expires_in": data.get("expires_in", 900),
     })
 
@@ -1505,12 +1654,14 @@ async def logout(request: Request) -> Response:
 
 
 # ── Gateway manager ───────────────────────────────────────────────────────────
-# Auto-respawn tuning. When the gateway exits without us asking it to — an
-# in-band `/restart` (inside a container hermes exits 75 expecting a supervisor
-# to bring it back; verified it takes the exit-75 path, NOT a detached
+# Auto-respawn tuning. When the gateway exits unexpectedly — an in-band
+# `/restart` (inside a container hermes exits 75 expecting a supervisor to
+# bring it back; verified it takes the exit-75 path, NOT a detached
 # self-restart, when /run/.containerenv or /.dockerenv exists), a crash, or an
-# OOM kill — server.py is that supervisor and must restart it. Nothing else
-# will, and /health stays 200, so the bot would otherwise sit silently dead.
+# OOM kill — server.py is that supervisor and must restart it. A clean exit 0
+# from Hermes' native Stop is intentional and stays stopped. Nothing else
+# revives unexpected exits, and /health stays 200, so the bot would otherwise
+# sit silently dead.
 # A crash-loop guard stops us hammering a gateway that genuinely can't stay up
 # (e.g. a bad provider key / model).
 RESPAWN_WINDOW_S   = 120     # rolling window (s) for counting unexpected exits
@@ -1543,6 +1694,8 @@ REPLACE_REFUSED_MARKER = "Refusing --replace"
 
 class Gateway:
     def __init__(self):
+        from weakref import WeakSet
+
         self.proc: asyncio.subprocess.Process | None = None
         self.state = "stopped"
         self.logs: deque[str] = deque(maxlen=500)
@@ -1552,6 +1705,11 @@ class Gateway:
         # exiting process's _drain() doesn't fire an auto-respawn that races the
         # intentional lifecycle.
         self._stopping = False
+        # _stopping is reset when a new start begins, possibly before the old
+        # process's stdout reaches EOF. Keep the stop verdict on the process
+        # itself so that delayed drain cannot charge a planned SIGTERM as a
+        # crash. Weak references avoid retaining an already-drained old child.
+        self._planned_stops = WeakSet()
         # Monotonic timestamps of recent unexpected exits (crash-loop guard).
         self._recent_exits: list[float] = []
         # Slow-loop guard: consecutive short-lived exits, and when the last one
@@ -1578,7 +1736,8 @@ class Gateway:
             provider_key = next((env.get(k, "") for k in PROVIDER_KEYS if env.get(k)), "")
             print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'}", flush=True)
             # Write config.yaml so hermes picks up the model (env vars alone aren't always enough)
-            write_config_yaml(read_env(ENV_FILE))
+            async with cfg_lock:
+                write_config_yaml(read_env(ENV_FILE))
             # --replace: force-displace any existing gateway.pid lock holder
             # before claiming it. Without this, a lock left behind by a prior
             # incarnation this supervisor doesn't recognize as "our" dead
@@ -1618,11 +1777,16 @@ class Gateway:
 
     async def stop(self):
         self._stopping = True
-        if not self.proc or self.proc.returncode is not None:
+        proc = self.proc
+        if proc is not None:
+            # The process may already have exited while its stdout is still
+            # draining. Mark it even in that case before restart() calls start().
+            self._planned_stops.add(proc)
+        if not proc or proc.returncode is not None:
             self.state = "stopped"
             return
         self.state = "stopping"
-        self.proc.terminate()
+        proc.terminate()
         try:
             # 70s, not 45s. The stop path is a chain, not one timeout:
             # `agent.cron_drain_timeout` (30) waits out an in-flight cron job,
@@ -1642,10 +1806,10 @@ class Gateway:
             # pid-file mess _clear_stale_pidfile() mops up stops happening.
             # On a container stop Railway's own grace period is the real
             # deadline; this bound only governs Restart / config-save.
-            await asyncio.wait_for(self.proc.wait(), timeout=70)
+            await asyncio.wait_for(proc.wait(), timeout=70)
         except asyncio.TimeoutError:
-            self.proc.kill()
-            await self.proc.wait()
+            proc.kill()
+            await proc.wait()
         self.state = "stopped"
         self.started_at = None
 
@@ -1659,12 +1823,26 @@ class Gateway:
         async for raw in proc.stdout:
             line = ANSI_ESCAPE.sub("", raw.decode(errors="replace").rstrip())
             self.logs.append(line)
-        rc = proc.returncode
+        # Pipe EOF can arrive before asyncio has published returncode. Wait for
+        # the process verdict so a native Dashboard Stop (exit 0) is not mistaken
+        # for an unexpected exit and immediately respawned.
+        rc = await proc.wait()
+        planned_stop = proc in self._planned_stops
+        self._planned_stops.discard(proc)
         # Ignore the drain of a process we've already replaced (e.g. via restart()).
         if proc is not self.proc:
             return
         # A deliberate stop()/restart()/reset owns its own lifecycle — don't respawn.
-        if self._stopping:
+        if planned_stop or self._stopping:
+            return
+        # Hermes' native dashboard Stop writes a planned-stop marker before
+        # signalling the gateway. A clean stop exits 0; respect that verdict
+        # even though this wrapper did not initiate the stop itself. Restarts
+        # still exit 75, while crashes and unexpected signals exit nonzero.
+        if rc == 0:
+            self.state = "stopped"
+            self.started_at = None
+            self.logs.append("[gateway] exited cleanly — stopped")
             return
         # Exit 78 = GATEWAY_FATAL_CONFIG_EXIT_CODE (gateway/restart.py): a
         # config error that no retry can fix — an invalid multiplexer config, or
@@ -2087,6 +2265,8 @@ async def api_config_put(request: Request):
         active_provider_key = str(body.pop("_active_provider_key", "") or "").strip()
         new_vars = body.get("vars", {})
         async with cfg_lock:
+            config_path = Path(HERMES_HOME) / "config.yaml"
+            current_cfg = _read_config_for_write(config_path)
             existing = read_env(ENV_FILE)
             merged = unmask(new_vars, existing)
             for k, v in existing.items():
@@ -2105,19 +2285,12 @@ async def api_config_put(request: Request):
                 and not _router_provider_is_configured(merged, key)
             }
             if removed_router_ids:
-                try:
-                    import yaml
-
-                    config_path = Path(HERMES_HOME) / "config.yaml"
-                    current_cfg = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
-                    current_model = current_cfg.get("model", {}) if isinstance(current_cfg, dict) else {}
-                    current_id = str(current_model.get("provider") or "").strip().lower()
-                    reset_removed_router_model = any(
-                        current_id in {provider_id, f"custom:{provider_id}"}
-                        for provider_id in removed_router_ids
-                    )
-                except (OSError, yaml.YAMLError):
-                    reset_removed_router_model = False
+                current_model = current_cfg.get("model", {})
+                current_id = str(current_model.get("provider") or "").strip().lower() if isinstance(current_model, dict) else ""
+                reset_removed_router_model = any(
+                    current_id in {provider_id, f"custom:{provider_id}"}
+                    for provider_id in removed_router_ids
+                )
             if reset_removed_router_model:
                 merged["LLM_MODEL"] = ""
             router_spec = MANAGED_ROUTER_PROVIDERS.get(active_provider_key)
@@ -2138,8 +2311,19 @@ async def api_config_put(request: Request):
                         {"error": f"{router_spec['name']}: {url_error}"},
                         status_code=400,
                     )
+            previous_env = ENV_FILE.read_text(encoding="utf-8") if ENV_FILE.exists() else None
             write_env(ENV_FILE, merged)
-            write_config_yaml(merged, reset_model=reset_removed_router_model)
+            try:
+                write_config_yaml(merged, reset_model=reset_removed_router_model)
+            except Exception:
+                # Config and .env are separate files. If the guarded config
+                # write refuses or fails, restore the exact prior credentials
+                # rather than leaving the next boot with a half-saved setup.
+                if previous_env is None:
+                    ENV_FILE.unlink(missing_ok=True)
+                else:
+                    _atomic_write_text(ENV_FILE, previous_env)
+                raise
 
         model_warning = None
         hermes_provider_id = HERMES_PROVIDER_IDS.get(active_provider_key)
@@ -2182,6 +2366,71 @@ async def api_config_put(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+async def _dashboard_storage_status() -> dict[str, str]:
+    """Read Hermes' bounded state.db check without making setup depend on it.
+
+    The dashboard's GET /api/status is public within Hermes' own auth gates,
+    but it is bound to loopback here and this result only reaches an admin via
+    /setup/api/status. Only copy its storage status and documented `corrupt`
+    reason; never return the larger upstream status payload.
+    """
+    unknown = {"status": "unknown"}
+    try:
+        response = await get_http_client().get(
+            f"{HERMES_DASHBOARD_URL}/api/status",
+            timeout=httpx.Timeout(3.0, connect=0.5),
+        )
+        if response.status_code != 200:
+            return unknown
+        payload = response.json()
+    except (httpx.RequestError, ValueError):
+        return unknown
+    components = payload.get("components") if isinstance(payload, dict) else None
+    storage = components.get("storage") if isinstance(components, dict) else None
+    if not isinstance(storage, dict) or storage.get("status") not in {"ok", "degraded"}:
+        return unknown
+    result = {"status": storage["status"]}
+    if storage["status"] == "degraded" and storage.get("reason") == "corrupt":
+        result["reason"] = "corrupt"
+    return result
+
+
+def _hindsight_configured() -> bool:
+    """Flag existing Hindsight selections for a targeted upgrade notice.
+
+    The setup panel is the root home's UI, but a shared gateway can serve
+    named profiles. Inspect their live config files too, without following
+    links or letting a damaged profile break the Status page.
+    """
+    root = Path(HERMES_HOME)
+    configs = [root / "config.yaml"]
+    profiles = root / "profiles"
+    try:
+        if not profiles.is_symlink() and profiles.is_dir():
+            tombstones = profiles / ".deleted"
+            has_tombstones = not tombstones.is_symlink() and tombstones.is_dir()
+            for entry in profiles.iterdir():
+                if entry.name == "default" or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", entry.name):
+                    continue
+                if entry.is_symlink() or not entry.is_dir():
+                    continue
+                marker = tombstones / entry.name
+                if has_tombstones and (marker.is_symlink() or marker.exists()):
+                    continue
+                configs.append(entry / "config.yaml")
+    except OSError:
+        pass  # Informational notice only; Status remains available.
+    for path in configs:
+        try:
+            cfg = _read_config_for_write(path)
+        except (OSError, ValueError):
+            continue
+        memory = cfg.get("memory")
+        if isinstance(memory, dict) and str(memory.get("provider") or "").strip().lower() == "hindsight":
+            return True
+    return False
+
+
 async def api_status(request: Request):
     if err := guard(request): return err
     data = read_env(ENV_FILE)
@@ -2198,8 +2447,11 @@ async def api_status(request: Request):
         name: {"configured": bool(v := data.get(key,"")) and v.lower() not in ("false","0","no")}
         for name, key in CHANNEL_MAP.items()
     }
+    storage = await _dashboard_storage_status()
     return JSONResponse({"gateway": gw.status(), "providers": providers,
                          "channels": channels, "hermes_version": HERMES_VERSION,
+                         "storage": storage,
+                         "hindsight_configured": _hindsight_configured(),
                          # None when running; a dict (possibly with null fields)
                          # when hermes' ESTOP sentinel is engaged — see
                          # estop_state() for why a green panel would otherwise
@@ -2256,11 +2508,20 @@ async def api_gw_restart(request: Request):
 
 async def api_config_reset(request: Request):
     if err := guard(request): return err
+    try:
+        async with cfg_lock:
+            _read_config_for_write(Path(HERMES_HOME) / "config.yaml")
+            previous_env = ENV_FILE.read_text(encoding="utf-8") if ENV_FILE.exists() else None
+            ENV_FILE.unlink(missing_ok=True)
+            try:
+                write_config_yaml({}, reset_model=True)
+            except Exception:
+                if previous_env is not None:
+                    _atomic_write_text(ENV_FILE, previous_env)
+                raise
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
     asyncio.create_task(gw.stop())
-    async with cfg_lock:
-        if ENV_FILE.exists():
-            ENV_FILE.unlink()
-        write_config_yaml({}, reset_model=True)
     return JSONResponse({"ok": True})
 
 
@@ -2278,16 +2539,37 @@ async def api_config_reset(request: Request):
 # entries still work here because we treat the key as an opaque handle.
 def _pjson(path: Path) -> dict:
     try:
-        return json.loads(path.read_text()) if path.exists() else {}
+        return _read_pairing_json(path)
     except Exception:
         return {}
 
 
+def _read_pairing_json(path: Path) -> dict:
+    """Read a pairing object for a write; preserve malformed files for recovery."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, UnicodeError) as e:
+        raise ValueError(f"invalid pairing JSON in {path.name}") from e
+    if not isinstance(data, dict):
+        raise ValueError(f"pairing JSON in {path.name} is not an object")
+    return data
+
+
 def _wjson(path: Path, data: dict):
+    """Replace a pairing file only after a complete private, synced JSON write."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-    try: os.chmod(path, 0o600)
-    except OSError: pass
+    serialized = json.dumps(data, indent=2, ensure_ascii=False)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.stem}-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        Path(tmp_name).unlink(missing_ok=True)
 
 
 def _platforms(suffix: str) -> list[str]:
@@ -2316,21 +2598,31 @@ async def api_pairing_approve(request: Request):
     platform, code = body.get("platform",""), body.get("code","").strip()
     if not platform or not code:
         return JSONResponse({"error": "platform and code required"}, status_code=400)
-    pending_path = pairing_dir() / f"{platform}-pending.json"
-    pending = _pjson(pending_path)
+    store = pairing_dir()
+    pending_path = store / f"{platform}-pending.json"
+    approved_path = store / f"{platform}-approved.json"
+    try:
+        pending = _read_pairing_json(pending_path)
+        approved = _read_pairing_json(approved_path)
+    except (OSError, ValueError) as e:
+        return JSONResponse({"error": f"Could not read pairing data: {e}"}, status_code=500)
     if code not in pending:
         return JSONResponse({"error": "Code not found"}, status_code=404)
-    entry = pending.pop(code)
+    entry = pending[code]
     user_id = (entry.get("user_id") or "").strip() if isinstance(entry, dict) else ""
     if not user_id:
         # Malformed/legacy entry without a user_id — leave it in pending (we
         # haven't written the pop yet) rather than silently discarding it.
         return JSONResponse({"error": "Pending entry has no user_id"}, status_code=422)
-    _wjson(pending_path, pending)
-    approved_path = pairing_dir() / f"{platform}-approved.json"
-    approved = _pjson(approved_path)
     approved[user_id] = {"user_name": entry.get("user_name",""), "approved_at": time.time()}
-    _wjson(approved_path, approved)
+    # Approval must be durable before deleting the pending request. If the
+    # second write fails, a retry can finish cleanup without losing the grant.
+    try:
+        _wjson(approved_path, approved)
+        del pending[code]
+        _wjson(pending_path, pending)
+    except (OSError, ValueError) as e:
+        return JSONResponse({"error": f"Could not finish pairing approval; retry safely: {e}"}, status_code=500)
     return JSONResponse({"ok": True})
 
 
@@ -2340,10 +2632,16 @@ async def api_pairing_deny(request: Request):
     except Exception: return JSONResponse({"error": "Invalid JSON"}, status_code=400)
     platform, code = body.get("platform",""), body.get("code","").strip()
     p = pairing_dir() / f"{platform}-pending.json"
-    pending = _pjson(p)
+    try:
+        pending = _read_pairing_json(p)
+    except (OSError, ValueError) as e:
+        return JSONResponse({"error": f"Could not read pairing data: {e}"}, status_code=500)
     if code in pending:
         del pending[code]
-        _wjson(p, pending)
+        try:
+            _wjson(p, pending)
+        except (OSError, ValueError) as e:
+            return JSONResponse({"error": f"Could not deny pairing request: {e}"}, status_code=500)
     return JSONResponse({"ok": True})
 
 
@@ -2357,6 +2655,113 @@ async def api_pairing_approved(request: Request):
     return JSONResponse({"approved": out})
 
 
+# These names mirror gateway/pairing.py's _PLATFORM_ALLOWLIST_ENV at v2026.9.24.
+# The gateway authorizes pairing and static allowlists as a union. Removing a
+# pairing row cannot honestly be called a revoke while another grant remains.
+_PAIRING_ALLOWLIST_ENV = {
+    "telegram": "TELEGRAM_ALLOWED_USERS", "discord": "DISCORD_ALLOWED_USERS",
+    "whatsapp": "WHATSAPP_ALLOWED_USERS", "whatsapp_cloud": "WHATSAPP_CLOUD_ALLOWED_USERS",
+    "slack": "SLACK_ALLOWED_USERS", "signal": "SIGNAL_ALLOWED_USERS",
+    "email": "EMAIL_ALLOWED_USERS", "sms": "SMS_ALLOWED_USERS",
+    "mattermost": "MATTERMOST_ALLOWED_USERS", "matrix": "MATRIX_ALLOWED_USERS",
+    "dingtalk": "DINGTALK_ALLOWED_USERS", "feishu": "FEISHU_ALLOWED_USERS",
+    "wecom": "WECOM_ALLOWED_USERS", "wecom_callback": "WECOM_CALLBACK_ALLOWED_USERS",
+    "weixin": "WEIXIN_ALLOWED_USERS", "bluebubbles": "BLUEBUBBLES_ALLOWED_USERS",
+    "qqbot": "QQ_ALLOWED_USERS", "yuanbao": "YUANBAO_ALLOWED_USERS",
+    "buzz": "BUZZ_ALLOWED_USERS", "simplex": "SIMPLEX_ALLOWED_USERS",
+}
+
+
+def _pairing_matching_ids(platform: str, approved: dict, user_id: str) -> list[str]:
+    """Use upstream's transitive phone/LID aliases for WhatsApp revocation."""
+    if platform in {"whatsapp", "whatsapp_cloud"}:
+        # LID mappings can make different numeric IDs the same person. A local
+        # string comparison could leave a second approved alias authorized.
+        from gateway.pairing import _matching_ids
+        return _matching_ids(platform, approved, user_id)
+    return [user_id] if user_id in approved else []
+
+
+def _pairing_allowlist_ids(raw: str) -> set[str]:
+    """Parse Hermes' CSV or JSON-list allowlist spellings conservatively."""
+    raw = raw.strip()
+    if raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return {"*"}  # An unknown nonempty policy must block a false revoke.
+        if isinstance(parsed, list):
+            return {str(value).strip() for value in parsed if str(value).strip()}
+        return {"*"}
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def _pairing_config_allowlist_ids(value: object) -> set[str]:
+    if value is None or value == "":
+        return set()
+    if isinstance(value, str):
+        # Hermes expands ${VAR} / ${env:VAR} before authorization. Comparing a
+        # raw template to a user ID would miss a live grant; fail closed.
+        if "${" in value:
+            return {"*"}
+        return _pairing_allowlist_ids(value)
+    if isinstance(value, list):
+        if any(isinstance(item, (dict, list, bool)) or item is None for item in value):
+            return {"*"}
+        if any("${" in str(item) for item in value):
+            return {"*"}
+        return {str(item).strip() for item in value if str(item).strip()}
+    # A malformed or unfamiliar nonempty policy must not certify a revoke.
+    return {"*"}
+
+
+def _pairing_revoke_grants(platform: str, user_id: str) -> tuple[list[str], list[str]]:
+    """Return proven direct grants and separate context-dependent policies."""
+    env = {**os.environ, **read_env(ENV_FILE)}
+    platform_key = _PAIRING_ALLOWLIST_ENV.get(platform, f"{platform.upper()}_ALLOWED_USERS")
+    candidates = [platform_key, "GATEWAY_ALLOWED_USERS"]
+    blockers = []
+    advisories = []
+    for key in ("GATEWAY_ALLOW_ALL_USERS", platform_key.replace("_ALLOWED_USERS", "_ALLOW_ALL_USERS")):
+        if env.get(key, "").strip().lower() in {"true", "1", "yes"}:
+            blockers.append(key)
+    for key in candidates:
+        allowed = _pairing_allowlist_ids(env.get(key, ""))
+        if "*" in allowed or _pairing_matching_ids(platform, dict.fromkeys(allowed), user_id):
+            blockers.append(key)
+        elif allowed and platform in {"buzz", "simplex"}:
+            # Upstream also matches Buzz npub/hex and SimpleX display names.
+            # A raw ID alone cannot prove whether a different entry matches.
+            advisories.append(key)
+    # Group/chat/role rules may grant access in a different context, but a
+    # configured group alone does not prove this DM user is admitted. Let the
+    # admin remove the pairing row and report the possible remaining rule.
+    if platform == "telegram":
+        advisories.extend(key for key in ("TELEGRAM_GROUP_ALLOWED_USERS", "TELEGRAM_GROUP_ALLOWED_CHATS")
+                          if env.get(key, "").strip())
+    if platform == "discord" and env.get("DISCORD_ALLOWED_ROLES", "").strip():
+        advisories.append("DISCORD_ALLOWED_ROLES")
+
+    # Native dashboard and plugin settings can grant access independently of
+    # the template's .env. Upstream authz_mixin reads these from platform extra.
+    config = _read_config_for_write(Path(HERMES_HOME) / "config.yaml")
+    gateway = config.get("gateway")
+    platforms = gateway.get("platforms") if isinstance(gateway, dict) else None
+    settings = platforms.get(platform) if isinstance(platforms, dict) else None
+    extra = settings.get("extra") if isinstance(settings, dict) else None
+    if isinstance(extra, dict):
+        for key in ("allow_from", "allowed_users"):
+            allowed = _pairing_config_allowlist_ids(extra.get(key))
+            if "*" in allowed or _pairing_matching_ids(platform, dict.fromkeys(allowed), user_id):
+                blockers.append(f"config.yaml gateway.platforms.{platform}.extra.{key}")
+            elif allowed and platform in {"buzz", "simplex"}:
+                advisories.append(f"config.yaml gateway.platforms.{platform}.extra.{key}")
+        for key in ("group_allow_from", "group_allowed_chats", "groups", "allowed_roles"):
+            if extra.get(key):
+                advisories.append(f"config.yaml gateway.platforms.{platform}.extra.{key}")
+    return blockers, advisories
+
+
 async def api_pairing_revoke(request: Request):
     if err := guard(request): return err
     try: body = await request.json()
@@ -2365,11 +2770,33 @@ async def api_pairing_revoke(request: Request):
     if not platform or not uid:
         return JSONResponse({"error": "platform and user_id required"}, status_code=400)
     p = pairing_dir() / f"{platform}-approved.json"
-    approved = _pjson(p)
-    if uid in approved:
-        del approved[uid]
+    try:
+        approved = _read_pairing_json(p)
+        matching = _pairing_matching_ids(platform, approved, uid)
+        if not matching:
+            return JSONResponse({"error": "Pairing approval no longer exists"}, status_code=404)
+        blockers, advisories = _pairing_revoke_grants(platform, uid)
+    except (OSError, ValueError, ImportError) as e:
+        return JSONResponse({"error": f"Could not verify pairing access safely: {e}"}, status_code=500)
+    if blockers:
+        return JSONResponse(
+            {"error": f"Access may also be granted by {', '.join(blockers)}. Remove that rule in "
+                      "Hermes settings or Railway variables, restart the gateway, then revoke the pairing approval."},
+            status_code=409,
+        )
+    for approved_id in matching:
+        del approved[approved_id]
+    try:
         _wjson(p, approved)
-    return JSONResponse({"ok": True})
+    except (OSError, ValueError) as e:
+        return JSONResponse({"error": f"Could not revoke pairing approval: {e}"}, status_code=500)
+    result = {"ok": True, "scope": "pairing"}
+    if advisories:
+        result["warning"] = (
+            "Pairing approval removed. Other access rules may still apply through "
+            + ", ".join(advisories) + "."
+        )
+    return JSONResponse(result)
 
 
 # ── Backup & Restore ─────────────────────────────────────────────────────────
@@ -2576,7 +3003,7 @@ def _in_excluded_root_dir(rel: Path) -> bool:
 
 
 def _live_db_names() -> set[str]:
-    """Base names of every SQLite DB on the volume that a backup should contain.
+    """Home-relative paths of SQLite DBs that Hermes backup should contain.
 
     Was hardcoded to state.db. v2026.8.13 keeps adding databases beside it
     (cron/notepad.db is new; kanban.db, cron/executions.db, projects.db,
@@ -2586,30 +3013,38 @@ def _live_db_names() -> set[str]:
     naming only state.db therefore certifies an archive as sound while other
     databases are silently absent from it.
 
-    Names, not paths: hermes writes some of these nested (cron/…), and
-    _incomplete_backup_reason compares against `Path(n).name` from the zip, so
-    both sides stay prefix-agnostic. Two same-named DBs in different
-    directories would compare as one — a false NEGATIVE, which is the safe
-    direction here (it never blocks a restore).
+    Full paths matter: root and named profiles can each have response_store.db.
+    A root copy must never hide a missing profile copy in a pre-restore snapshot.
+    The legacy function name is retained for existing callers.
     """
     root = Path(HERMES_HOME)
+    if not root.is_dir():
+        raise OSError(f"Hermes home is not a readable directory: {root}")
     found: set[str] = set()
-    try:
-        for path in root.rglob("*.db"):
-            try:
-                if not path.is_file():
-                    continue
-                rel = path.relative_to(root)
-            except (OSError, ValueError):
+
+    def scan_error(error: OSError) -> None:
+        raise error
+
+    # Match upstream's os.walk(followlinks=False) and directory pruning. onerror
+    # is mandatory: its default silently skips unreadable trees, which could
+    # certify a partial safety snapshot as complete.
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=scan_error):
+        rel_dir = Path(dirpath).relative_to(root)
+        is_root = rel_dir == Path(".")
+        dirnames[:] = [
+            name for name in dirnames
+            if (name not in _BACKUP_EXCLUDED_DIRS or (name == "hermes-agent" and not is_root))
+            and not _in_excluded_root_dir(rel_dir / name)
+        ]
+        for name in filenames:
+            if not name.endswith(".db"):
                 continue
-            if any(part in _BACKUP_EXCLUDED_DIRS for part in rel.parts[:-1]):
-                continue
+            rel = rel_dir / name
             if _in_excluded_root_dir(rel):
                 continue
-            found.add(path.name)
-    except OSError:
-        # Can't walk the volume — say nothing rather than block a restore.
-        return set()
+            path = root / rel
+            if stat.S_ISREG(path.lstat().st_mode):
+                found.add(rel.as_posix())
     return found
 
 
@@ -2631,10 +3066,15 @@ def _incomplete_backup_reason(zip_path: Path) -> str | None:
     """
     try:
         with zipfile.ZipFile(zip_path) as zf:
-            names = {Path(n).name for n in zf.namelist()}
+            names = {Path(n).as_posix() for n in zf.namelist()}
     except Exception as e:
         return f"the archive could not be read back ({e})"
-    missing = sorted(_live_db_names() - names)
+    try:
+        missing = sorted(_live_db_names() - names)
+    except OSError as e:
+        # Download still returns the useful partial archive with a warning;
+        # pre-restore treats this reason as a hard stop before changing data.
+        return f"could not inspect live databases ({e})"
     if not missing:
         return None
     if "state.db" in missing:
@@ -2883,9 +3323,9 @@ BACK_TO_SETUP_WIDGET = (
     '</div>'
 )
 
-# Dashboard actions that install into the running container. Tools -> post-setup
-# (hermes_cli/web_routers/tools.py) npm/pip-installs into /opt/hermes-agent and
-# is just as ephemeral as the memory-provider path, but shipped with no warning.
+# Dashboard actions that can install software at runtime. Their persistence is
+# provider-specific: Hermes pip/lazy packages go to /data/.hermes/lazy-packages,
+# while some tool post-setup hooks still mutate the disposable image.
 # MCP catalog install is deliberately NOT here: it installs under
 # $HERMES_HOME/mcp-installs on the volume, so it does survive a redeploy.
 _IN_CONTAINER_INSTALL_RE = re.compile(
@@ -2904,15 +3344,9 @@ _IN_CONTAINER_INSTALL_RE = re.compile(
 # in the same file, which DID gain entries (lightpanda) — that one only gates an
 # interactive `hermes tools` prompt and never runs from an HTTP request.
 #
-# This is log-only, deliberately: unlike the two POST paths, we do NOT inject a
-# confirm() here. The existing notice says the install is wiped on redeploy,
-# and for cua_driver that is probably FALSE — its installer targets
-# ~/.local/bin, and the Dockerfile sets HOME=/data, so it most likely lands on
-# the Railway volume and survives (same reasoning that keeps
-# POST /api/mcp/catalog/install deliberately uncovered). Telling the user their
-# install is about to vanish when it will not is worse than staying quiet, so
-# we take the log line — which is what was actually missing — and skip the
-# popup until a path is confirmed to write into the image.
+# This is log-only: cua_driver's external installer may target ~/.local/bin,
+# which is on /data here, and a toolset toggle is not a clear install consent
+# moment. The POST warning below now describes mixed persistence accurately.
 _IN_CONTAINER_INSTALL_PUT_RE = re.compile(r"^/api/tools/toolsets/[^/]+$")
 
 
@@ -2930,14 +3364,9 @@ def _in_container_install_kind(method: str, path: str) -> str | None:
         return "install-on-enable"
     return None
 
-# Warn before any dashboard action that installs into the RUNNING container.
-# Neither endpoint carries an install-method check, so the `.install_method=docker`
-# stamp (invariant 4) does not refuse them, and on Railway the image is immutable:
-# the package disappears on the next redeploy while config.yaml still names it.
-# Only the PACKAGE is lost — settings live in config.yaml/.env on the volume — so
-# re-running the install fully restores it, which is what the notice says. We warn
-# rather than block so a quick trial stays possible, and point at a GitHub issue
-# rather than the Dockerfile, since most people deploy this without a fork.
+# Warn without claiming every install vanishes on redeploy. The upstream
+# installer may use the durable lazy target, a persistent home path, or a
+# provider-specific shell hook. The Docker stamp blocks only core self-update.
 IMMUTABLE_INSTALL_WARNING_JS = (
     '<script>(function(){'
     'var f=window.fetch;if(!f||window.__hermesImmutableWarn)return;'
@@ -2948,20 +3377,12 @@ IMMUTABLE_INSTALL_WARNING_JS = (
     'if(m==="POST"&&/\\/api\\/(memory\\/providers\\/[^\\/]+\\/setup|tools\\/toolsets\\/[^\\/]+\\/post-setup)/.test(u)&&'
     '!window.confirm("MESSAGE FROM THE TEMPLATE CREATOR\\n'
     '----------------------------------------\\n\\n'
-    'This template is deployed on Railway as an immutable container: the image is '
-    'rebuilt from scratch on every deploy, so anything installed into the running '
-    'container is wiped.\\n\\n'
-    'Installing this will work right now, but only until your next deploy. '
-    'After that it stays configured while its package is gone, and the agent '
-    'fails to start it.\\n\\n'
-    'If that happens, just install it again from here — your settings and API '
-    'keys are stored on the Railway volume, not inside the container, so '
-    'nothing needs reconfiguring and it resumes where it left off.\\n\\n'
-    'To have it included permanently, please raise an issue here:\\n'
-    'https://github.com/praveen-ks-2001/hermes-agent-template/issues\\n\\n'
-    'It will be reviewed and built into the template, so next time it works out '
-    'of the box with no install step.\\n\\n'
-    'Install anyway (temporary)?"))'
+    'This setup may install software at runtime. Hermes packages installed in '
+    'the persistent /data directory survive redeploys; some provider-specific '
+    'installers write into the disposable image and may need to be run again.\\n\\n'
+    'Your saved settings and credentials remain on the volume. After a redeploy, '
+    'check that this integration is still available.\\n\\n'
+    'Continue with setup?"))'
     '{return Promise.reject(new Error("Cancelled: immutable deployment"));}'
     '}catch(e){}return f.apply(this,arguments);};})();</script>'
 )
@@ -3226,8 +3647,8 @@ async def route_proxy(request: Request) -> Response:
     # after the next redeploy.
     kind = _in_container_install_kind(request.method, request.url.path)
     if kind == "warned":
-        print(f"[proxy] in-container install requested: {request.url.path} — "
-              f"immutable image, this will not survive a redeploy", flush=True)
+        print(f"[proxy] runtime setup requested: {request.url.path} — "
+              "persistence depends on the install target", flush=True)
     elif kind == "install-on-enable":
         # No confirm() fires for this one — see _IN_CONTAINER_INSTALL_PUT_RE.
         # This line is the only trace that a toolset toggle kicked off a
