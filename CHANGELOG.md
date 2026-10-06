@@ -28,6 +28,7 @@ release.
 
 ### Bug fixes
 - **Large manual backups now run as visible background jobs.** Create one from Backup & Restore, watch its phase and file count, and download the prepared ZIP in a separate request. The job and its outcome remain visible after a page reload. Prepared downloads remain available for 6 hours while the container stays up; a restart clearly marks an interrupted or unavailable job so it can be retried.
+- **Backup entries can be removed individually.** Remove clears an expired or failed entry; removing a ready backup also deletes its prepared ZIP after confirmation. A running backup or active download is protected.
 - **Unreadable config is preserved.** Save, gateway start, and xAI OAuth now report a config error instead of replacing the saved file with an empty one.
 - **Pairing approvals survive legacy folder aliases and interrupted writes.** Revoke warns when another access rule may still grant access, instead of claiming the user was blocked.
 - **Status now flags detected chat-history storage problems; Dashboard Stop stays stopped, and planned Restarts no longer count as crashes.**

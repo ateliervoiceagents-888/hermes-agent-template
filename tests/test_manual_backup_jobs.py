@@ -148,10 +148,68 @@ sys.exit(int(os.environ.get('FAKE_BACKUP_EXIT', '0')))
                 self.assertEqual(expired["status"], "expired")
                 self.assertFalse(self.server._manual_backup_paths(new_id)[1].exists())
 
+    async def test_remove_ready_backup_deletes_zip_but_not_restore_snapshot(self):
+        self.server.guard = lambda _request: None
+        async with await self.api() as client:
+            job_id = (await client.post("/setup/api/backup/jobs")).json()["job"]["id"]
+            ready = await self.wait_for_job(client, job_id)
+            self.assertEqual(ready["status"], "ready")
+            archive = self.server._manual_backup_paths(job_id)[1]
+            self.assertTrue(archive.exists())
+            snapshot = self.home / "backups" / "pre-restore-123-abcd1234.zip"
+            snapshot.write_bytes(b"untouched snapshot")
+
+            removed = await client.delete(f"/setup/api/backup/jobs/{job_id}")
+            self.assertEqual(removed.status_code, 200, removed.text)
+            self.assertTrue(removed.json()["ok"])
+            self.assertFalse(archive.exists())
+            self.assertEqual((await client.get("/setup/api/backup/jobs")).json()["jobs"], [])
+            self.assertEqual(snapshot.read_bytes(), b"untouched snapshot")
+            self.assertEqual((await client.get(ready["download_url"])).status_code, 404)
+
+    async def test_remove_expired_record_and_protect_running_or_downloaded_backup(self):
+        self.server.guard = lambda _request: None
+        old_id = "b" * 24
+        self.server._manual_backup_jobs_write([{
+            "id": old_id, "status": "expired", "phase": "expired",
+            "started_at": time.time() - 3600, "finished_at": time.time() - 3500,
+            "error": "Prepared backup expired", "warning": None,
+        }])
+        async with await self.api() as client:
+            self.assertEqual((await client.delete(f"/setup/api/backup/jobs/{old_id}")).status_code, 200)
+            self.assertEqual((await client.get("/setup/api/backup/jobs")).json()["jobs"], [])
+            with patch.dict(os.environ, {"FAKE_BACKUP_SLEEP": ".3"}):
+                job_id = (await client.post("/setup/api/backup/jobs")).json()["job"]["id"]
+                running = await client.delete(f"/setup/api/backup/jobs/{job_id}")
+                self.assertEqual(running.status_code, 409)
+                self.assertIn("finish", running.json()["error"])
+                ready = await self.wait_for_job(client, job_id)
+            self.assertEqual(ready["status"], "ready")
+            self.server._manual_backup_downloads.add(job_id)
+            try:
+                downloading = await client.delete(f"/setup/api/backup/jobs/{job_id}")
+                self.assertEqual(downloading.status_code, 409)
+                self.assertIn("downloaded", downloading.json()["error"])
+            finally:
+                self.server._manual_backup_downloads.discard(job_id)
+            self.assertEqual((await client.delete(f"/setup/api/backup/jobs/{job_id}")).status_code, 200)
+
+    async def test_remove_failure_does_not_hide_undeleted_zip(self):
+        self.server.guard = lambda _request: None
+        async with await self.api() as client:
+            job_id = (await client.post("/setup/api/backup/jobs")).json()["job"]["id"]
+            self.assertEqual((await self.wait_for_job(client, job_id))["status"], "ready")
+            with patch.object(self.server.shutil, "rmtree", return_value=None):
+                response = await client.delete(f"/setup/api/backup/jobs/{job_id}")
+            self.assertEqual(response.status_code, 500)
+            self.assertEqual((await client.get("/setup/api/backup/jobs")).json()["jobs"][0]["id"], job_id)
+            self.assertTrue(self.server._manual_backup_paths(job_id)[1].exists())
+
     async def test_auth_and_backup_lock(self):
         async with await self.api() as client:
             for method, url in (("GET", "/setup/api/backup/jobs"),
                                 ("POST", "/setup/api/backup/jobs"),
+                                ("DELETE", "/setup/api/backup/jobs/" + "a" * 24),
                                 ("GET", "/setup/api/backup/jobs/" + "a" * 24 + "/download")):
                 response = await client.request(method, url)
                 self.assertEqual(response.status_code, 401)
@@ -165,3 +223,5 @@ sys.exit(int(os.environ.get('FAKE_BACKUP_EXIT', '0')))
                 self.server.backup_lock.release()
             bad_id = await client.get("/setup/api/backup/jobs/bad/download")
             self.assertEqual(bad_id.status_code, 404)
+            self.assertEqual((await client.delete("/setup/api/backup/jobs/bad")).status_code, 404)
+            self.assertEqual((await client.delete("/setup/api/backup/jobs/" + "a" * 24)).status_code, 404)

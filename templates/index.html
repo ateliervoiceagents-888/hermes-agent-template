@@ -1725,15 +1725,22 @@
             <span x-show="backupBusy">Starting…</span>
           </button>
           <button class="btn" type="button" @click="loadBackupJobs()" style="margin-left:8px;">Refresh status</button>
-          <div class="restore-result err" x-show="backupStatusError" role="alert" x-cloak>
-            <span x-text="backupStatusError"></span>
+          <div class="restore-result err" x-show="backupStatusError || backupActionError" role="alert" x-cloak>
+            <span x-text="backupActionError || backupStatusError"></span>
           </div>
           <div x-show="backupJobs.length" x-cloak style="margin-top:16px;" role="status" aria-live="polite">
             <template x-for="job in backupJobs" :key="job.id">
               <div style="padding:11px 0;border-top:1px solid var(--border);font-size:13px;line-height:1.55;">
                 <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
                   <strong x-text="job.status === 'running' ? 'Creating backup' : job.status === 'ready' ? 'Backup ready' : job.status === 'failed' ? 'Backup failed' : 'Backup expired'"></strong>
-                  <span style="color:var(--text-dim);" x-text="fmtDate(job.started_at)"></span>
+                  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <span style="color:var(--text-dim);" x-text="fmtDate(job.started_at)"></span>
+                    <button class="btn sm danger" type="button" @click="removeBackupJob(job)"
+                            :disabled="job.status === 'running' || !!removingBackupId"
+                            :aria-label="'Remove backup from ' + fmtDate(job.started_at)">
+                      <span x-text="removingBackupId === job.id ? 'Removing…' : 'Remove'"></span>
+                    </button>
+                  </div>
                 </div>
                 <div x-show="job.status === 'ready' || job.status === 'running'"
                      style="color:var(--text-dim);margin-top:3px;" x-text="backupJobText(job)"></div>
@@ -1956,6 +1963,7 @@
           <div class="changelog-group">Bug fixes</div>
           <ul class="changelog-list">
             <li><strong>Large manual backups now run as visible background jobs.</strong> Create one from Backup &amp; Restore, watch its phase and file count, and download the prepared ZIP in a separate request. The job and its outcome remain visible after a page reload. Prepared downloads remain available for 6 hours while the container stays up; a restart clearly marks an interrupted or unavailable job so it can be retried.</li>
+            <li><strong>Backup entries can be removed individually.</strong> Remove clears an expired or failed entry; removing a ready backup also deletes its prepared ZIP after confirmation. A running backup or active download is protected.</li>
             <li><strong>Unreadable config is no longer replaced.</strong> Save, gateway start and xAI OAuth show an error so you can repair the original file.</li>
             <li><strong>Pairing approvals survive legacy folder aliases and interrupted writes.</strong> Revoke warns when another access rule may still grant access instead of claiming the user was blocked.</li>
             <li><strong>Status now flags detected chat-history storage problems; Dashboard Stop stays stopped, and planned Restarts no longer count as crashes.</strong></li>
@@ -2334,8 +2342,11 @@ function app() {
     approved: [],
     snapshots: [],
     backupJobs: [],
+    backupJobsRequestSeq: 0,
     backupStatusError: '',
+    backupActionError: '',
     backupBusy: false,
+    removingBackupId: null,
     restoreBusy: false,
     restoreFile: null,
     restoreDragging: false,
@@ -2729,19 +2740,23 @@ function app() {
     },
 
     async loadBackupJobs() {
+      const requestSeq = ++this.backupJobsRequestSeq;
       try {
         const r = await fetch('/setup/api/backup/jobs', {cache: 'no-store'});
         const data = await r.json();
         if (!r.ok) throw new Error(data.error || 'Could not read backup status');
+        if (requestSeq !== this.backupJobsRequestSeq) return;
         this.backupJobs = data.jobs || [];
         this.backupStatusError = '';
       } catch (e) {
+        if (requestSeq !== this.backupJobsRequestSeq) return;
         this.backupStatusError = `Could not refresh backup status: ${e.message}. Retry with Refresh status.`;
       }
     },
 
     async createBackup() {
       this.backupBusy = true;
+      this.backupActionError = '';
       const attemptedAt = Date.now() / 1000;
       try {
         const r = await fetch('/setup/api/backup/jobs', {method: 'POST'});
@@ -2749,6 +2764,7 @@ function app() {
         if (!r.ok) {
           throw new Error(data.error || 'Could not start backup');
         }
+        this.backupJobsRequestSeq++;
         this.backupJobs = [data.job, ...this.backupJobs.filter(j => j.id !== data.job.id)];
         this.backupStatusError = '';
       } catch (e) {
@@ -2760,6 +2776,33 @@ function app() {
         }
       }
       this.backupBusy = false;
+    },
+
+    async removeBackupJob(job) {
+      if (job.status === 'running' || this.removingBackupId) return;
+      const message = job.status === 'ready'
+        ? 'Remove this backup and permanently delete its prepared ZIP? Download it first if you need it.'
+        : 'Remove this backup entry from the list?';
+      if (!confirm(message)) return;
+      this.removingBackupId = job.id;
+      this.backupActionError = '';
+      try {
+        const r = await fetch(`/setup/api/backup/jobs/${encodeURIComponent(job.id)}`, {method: 'DELETE'});
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || 'The server could not remove this backup');
+        this.backupJobsRequestSeq++;
+        this.backupJobs = this.backupJobs.filter(item => item.id !== job.id);
+        await this.loadBackupJobs();
+      } catch (e) {
+        // A lost response may arrive after the server removed the job. Re-read
+        // before showing an error or encouraging another click.
+        await this.loadBackupJobs();
+        if (this.backupJobs.some(item => item.id === job.id)) {
+          this.backupActionError = `Could not remove backup: ${e.message}`;
+        }
+      } finally {
+        this.removingBackupId = null;
+      }
     },
 
     async loadSnapshots() {

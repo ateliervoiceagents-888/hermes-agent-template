@@ -3401,6 +3401,30 @@ async def api_backup_jobs_start(request: Request) -> Response:
             return JSONResponse({"error": f"Could not start backup: {exc}"}, status_code=500)
 
 
+async def api_backup_job_delete(request: Request) -> Response:
+    if err := guard(request): return err
+    job_id = request.path_params.get("job_id", "")
+    if not MANUAL_BACKUP_ID_RE.fullmatch(job_id):
+        return JSONResponse({"error": "Invalid backup job ID"}, status_code=404)
+    try:
+        jobs = _manual_backup_jobs_reconcile(_manual_backup_jobs_read())
+        job = next((item for item in jobs if item["id"] == job_id), None)
+        if job is None:
+            return JSONResponse({"error": "Backup job not found"}, status_code=404)
+        if job["status"] == "running":
+            return JSONResponse({"error": "Wait for this backup to finish before removing it."}, status_code=409)
+        if not _manual_backup_remove_artifact(job_id):
+            return JSONResponse({"error": "This backup is being downloaded. Try again when the download finishes."},
+                                status_code=409)
+        directory, _, _ = _manual_backup_paths(job_id)
+        if directory.exists():
+            raise OSError("Could not remove the prepared backup file")
+        _manual_backup_jobs_write([item for item in jobs if item["id"] != job_id])
+        return JSONResponse({"ok": True}, headers={"Cache-Control": "private, no-store"})
+    except (OSError, ValueError) as exc:
+        return JSONResponse({"error": f"Could not remove backup: {exc}"}, status_code=500)
+
+
 async def api_backup_job_download(request: Request) -> Response:
     if err := guard(request): return err
     job_id = request.path_params.get("job_id", "")
@@ -4299,6 +4323,7 @@ routes = [
     Route("/setup/api/oauth/xai",               api_oauth_xai_delete, methods=["DELETE"]),
     Route("/setup/api/backup/jobs",             api_backup_jobs_get, methods=["GET"]),
     Route("/setup/api/backup/jobs",             api_backup_jobs_start, methods=["POST"]),
+    Route("/setup/api/backup/jobs/{job_id}",    api_backup_job_delete, methods=["DELETE"]),
     Route("/setup/api/backup/jobs/{job_id}/download", api_backup_job_download),
     Route("/setup/api/backup/download",         api_backup_download),
     Route("/setup/api/backup/restore",          api_backup_restore,  methods=["POST"]),
