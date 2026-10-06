@@ -20,7 +20,7 @@ Deploy [Hermes Agent](https://github.com/NousResearch/hermes-agent) on [Railway]
 - **User Pairing** — approve or deny users who message your bot, remove pairing approvals, and see when a separate access rule still grants a user access
 - **Password-Protected** — one cookie-based login guards both the setup wizard and the Hermes dashboard
 - **Reset Config** — one-click reset to start fresh
-- **Backup & Restore** — download a zip of Hermes-home data (config, credentials, chat history, skills, and supported provider files) and restore it into this or a fresh project. It is not encrypted; a safety snapshot is taken automatically before every restore. External memory services and Hindsight's embedded PostgreSQL data are outside this zip.
+- **Backup & Restore** — create a background backup, see its progress after reload, and download the prepared zip of Hermes-home data (config, credentials, chat history, skills, and supported provider files). The download is available for 6 hours while the container stays up; download it before redeploying. It is not encrypted; a safety snapshot is taken automatically before every restore. External memory services and Hindsight's embedded PostgreSQL data are outside this zip.
 
 ## Getting Started
 

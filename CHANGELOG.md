@@ -11,7 +11,7 @@ release.
 
 ---
 
-## release/v2026.9.24/1 — September 27, 2026
+## release/v2026.9.24/1 — October 6, 2026
 **Hermes v2026.9.24 · major (Hermes upgrade, from v2026.9.21)**
 
 ### Hermes update
@@ -27,6 +27,7 @@ release.
 - **Restore refuses an incomplete safety snapshot.** Databases in different profiles are checked by their full paths, so a same-named root database cannot hide a missing profile database.
 
 ### Bug fixes
+- **Large manual backups now run as visible background jobs.** Create one from Backup & Restore, watch its phase and file count, and download the prepared ZIP in a separate request. The job and its outcome remain visible after a page reload. Prepared downloads remain available for 6 hours while the container stays up; a restart clearly marks an interrupted or unavailable job so it can be retried.
 - **Unreadable config is preserved.** Save, gateway start, and xAI OAuth now report a config error instead of replacing the saved file with an empty one.
 - **Pairing approvals survive legacy folder aliases and interrupted writes.** Revoke warns when another access rule may still grant access, instead of claiming the user was blocked.
 - **Status now flags detected chat-history storage problems; Dashboard Stop stays stopped, and planned Restarts no longer count as crashes.**

@@ -2855,6 +2855,151 @@ SNAPSHOT_NAME_RE = re.compile(r"^pre-restore-\d+-[0-9a-f]+\.zip$")
 
 backup_lock = asyncio.Lock()
 
+# The manual backup UI uses a short create request, a polled job, and a separate
+# download. Railway closes an HTTP request after 5 minutes without response
+# bytes; creating the entire ZIP inside GET /download can exceed that limit.
+# Keep tiny job records on the volume so a reload/redeploy explains what
+# happened, while large ZIPs stay on ephemeral disk and never bloat the volume.
+MANUAL_BACKUP_INDEX = BACKUP_DIR / ".template-manual-backup-jobs.json"
+MANUAL_BACKUP_TMP = Path(tempfile.gettempdir()) / "hermes-template-manual-backups"
+MANUAL_BACKUP_ID_RE = re.compile(r"^[0-9a-f]{24}$")
+MANUAL_BACKUP_TIMEOUT = 30 * 60
+MANUAL_BACKUP_READY_TTL = 6 * 60 * 60
+MANUAL_BACKUP_KEEP_READY = 2
+MANUAL_BACKUP_KEEP_RECORDS = 5
+_manual_backup_start_lock = asyncio.Lock()
+_manual_backup_task: asyncio.Task | None = None
+_manual_backup_active_id: str | None = None
+_manual_backup_downloads: set[str] = set()
+
+
+def _manual_backup_paths(job_id: str) -> tuple[Path, Path, Path]:
+    if not MANUAL_BACKUP_ID_RE.fullmatch(job_id):
+        raise ValueError("Invalid backup job ID")
+    directory = MANUAL_BACKUP_TMP / job_id
+    return directory, directory / "backup.zip", directory / "output.log"
+
+
+def _manual_backup_jobs_read() -> list[dict]:
+    try:
+        mode = MANUAL_BACKUP_INDEX.lstat().st_mode
+        if not stat.S_ISREG(mode):
+            raise ValueError("Backup job state is not a regular file")
+        data = json.loads(MANUAL_BACKUP_INDEX.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as exc:
+        raise ValueError("Could not read backup job state safely") from exc
+    if not isinstance(data, list) or any(
+        not isinstance(job, dict)
+        or not MANUAL_BACKUP_ID_RE.fullmatch(str(job.get("id", "")))
+        or job.get("status") not in {"running", "ready", "failed", "expired"}
+        or not isinstance(job.get("started_at"), (int, float))
+        or (job.get("finished_at") is not None and not isinstance(job["finished_at"], (int, float)))
+        for job in data
+    ):
+        raise ValueError("Backup job state has an unrecognized format")
+    return data
+
+
+def _manual_backup_jobs_write(jobs: list[dict]) -> None:
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    if not stat.S_ISDIR(BACKUP_DIR.lstat().st_mode):
+        raise ValueError("Backup directory is not a real directory")
+    _atomic_write_text(MANUAL_BACKUP_INDEX, json.dumps(jobs, separators=(",", ":")) + "\n")
+
+
+def _manual_backup_remove_artifact(job_id: str) -> bool:
+    if job_id in _manual_backup_downloads:
+        return False
+    directory, _, _ = _manual_backup_paths(job_id)
+    if directory.is_symlink():
+        raise ValueError("Backup job directory is linked")
+    shutil.rmtree(directory, ignore_errors=True)
+    return True
+
+
+def _manual_backup_jobs_reconcile(jobs: list[dict]) -> list[dict]:
+    """Explain interrupted/expired work and bound retained ZIPs on every read."""
+    now = time.time()
+    changed = False
+    jobs.sort(key=lambda job: float(job.get("started_at") or 0), reverse=True)
+    for job in jobs:
+        job_id = job["id"]
+        _, archive, _ = _manual_backup_paths(job_id)
+        if job["status"] == "running" and job_id != _manual_backup_active_id:
+            job.update(status="failed", phase="failed", finished_at=now,
+                       error="Backup was interrupted by a service restart. Create another backup.")
+            _manual_backup_remove_artifact(job_id)
+            changed = True
+        elif job["status"] == "ready":
+            expired = now >= float(job.get("finished_at") or 0) + MANUAL_BACKUP_READY_TTL
+            missing = not archive.is_file()
+            if (expired or missing) and _manual_backup_remove_artifact(job_id):
+                job.update(status="expired", phase="expired",
+                           error="Prepared backup expired or is unavailable after a container restart. Create another backup.")
+                changed = True
+    ready = [job for job in jobs if job["status"] == "ready"]
+    for job in ready[MANUAL_BACKUP_KEEP_READY:]:
+        if _manual_backup_remove_artifact(job["id"]):
+            job.update(status="expired", phase="expired",
+                       error="A newer backup replaced this download. Create another backup if needed.")
+            changed = True
+    while len(jobs) > MANUAL_BACKUP_KEEP_RECORDS and jobs[-1]["id"] not in _manual_backup_downloads:
+        old = jobs.pop()
+        _manual_backup_remove_artifact(old["id"])
+        changed = True
+    if changed:
+        _manual_backup_jobs_write(jobs)
+    return jobs
+
+
+def _manual_backup_job_update(job_id: str, **changes) -> dict:
+    jobs = _manual_backup_jobs_read()
+    job = next((item for item in jobs if item["id"] == job_id), None)
+    if job is None:
+        raise ValueError("Backup job record disappeared")
+    job.update(changes)
+    _manual_backup_jobs_write(jobs)
+    return job
+
+
+def _manual_backup_log_progress(job_id: str) -> tuple[str, int | None, int | None]:
+    """Read only a bounded log tail; Hermes reports file counts every 500 files."""
+    _, _, log_path = _manual_backup_paths(job_id)
+    try:
+        with log_path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 64 * 1024))
+            lines = stream.read().decode("utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return "preparing", None, None
+    phase, completed, total = "scanning", None, None
+    for line in lines:
+        stripped = line.strip()
+        if match := re.fullmatch(r"Backing up (\d+) files \.\.\.", stripped):
+            phase, total = "archiving", int(match.group(1))
+        elif match := re.fullmatch(r"(\d+)/(\d+) files \.\.\.", stripped):
+            phase, completed, total = "archiving", int(match.group(1)), int(match.group(2))
+    return phase, completed, total
+
+
+def _manual_backup_job_public(job: dict) -> dict:
+    status = job["status"]
+    phase, completed, total = _manual_backup_log_progress(job["id"]) if status == "running" else (
+        job.get("phase", status), job.get("completed_files"), job.get("total_files"))
+    if status == "running" and job.get("phase") == "verifying":
+        phase = "verifying"
+    result = {key: job.get(key) for key in (
+        "id", "status", "started_at", "finished_at", "size_bytes", "warning", "error"
+    )}
+    result.update(phase=phase, completed_files=completed, total_files=total,
+                  elapsed_seconds=max(0, int((job.get("finished_at") or time.time()) - float(job["started_at"]))))
+    if status == "ready":
+        result["download_url"] = f"/setup/api/backup/jobs/{job['id']}/download"
+        result["expires_at"] = float(job["finished_at"]) + MANUAL_BACKUP_READY_TTL
+    return result
+
 
 async def _run_hermes_cli(*args: str, timeout: float = BACKUP_SUBPROCESS_TIMEOUT) -> tuple[int, str]:
     """Run a `hermes <args>` subcommand, capturing combined stdout+stderr.
@@ -3083,6 +3228,205 @@ def _incomplete_backup_reason(zip_path: Path) -> str | None:
         tail = f" (also {', '.join(others)})" if others else ""
         return f"state.db (sessions and chat history) is missing from the archive{tail}"
     return f"{', '.join(missing)} missing from the archive"
+
+
+def _manual_backup_prepare_dir(job_id: str) -> Path:
+    MANUAL_BACKUP_TMP.mkdir(mode=0o700, exist_ok=True)
+    if not stat.S_ISDIR(MANUAL_BACKUP_TMP.lstat().st_mode):
+        raise ValueError("Temporary backup directory is not a real directory")
+    directory, archive, _ = _manual_backup_paths(job_id)
+    directory.mkdir(mode=0o700)
+    return archive
+
+
+def _manual_backup_log_tail(job_id: str) -> str:
+    _, _, log_path = _manual_backup_paths(job_id)
+    try:
+        with log_path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 16 * 1024))
+            return stream.read().decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
+def _manual_backup_failed(job_id: str, message: str) -> None:
+    try:
+        _manual_backup_job_update(job_id, status="failed", phase="failed",
+                                  finished_at=time.time(), error=message)
+    except (OSError, ValueError) as exc:
+        print(f"[backup-job] could not persist failure for {job_id}: {exc}", flush=True)
+    try:
+        _manual_backup_remove_artifact(job_id)
+    except (OSError, ValueError) as exc:
+        print(f"[backup-job] could not remove failed artifact for {job_id}: {exc}", flush=True)
+    print(f"[backup-job] {job_id} failed: {message}", flush=True)
+
+
+async def _manual_backup_run(job_id: str) -> None:
+    """Build one ZIP off-request so the browser never waits through generation."""
+    global _manual_backup_active_id, _manual_backup_task
+    _, archive, log_path = _manual_backup_paths(job_id)
+    proc = None
+    try:
+        env = {**build_hermes_env(), "PYTHONUNBUFFERED": "1"}
+        with log_path.open("wb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            proc = await asyncio.create_subprocess_exec(
+                "hermes", "backup", "-o", str(archive),
+                stdout=stream, stderr=asyncio.subprocess.STDOUT, env=env,
+            )
+            print(f"[backup-job] {job_id} started pid={proc.pid}", flush=True)
+            try:
+                rc = await asyncio.wait_for(proc.wait(), timeout=MANUAL_BACKUP_TIMEOUT)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                _manual_backup_failed(job_id, "Backup exceeded 30 minutes. Check deployment logs and try again.")
+                return
+
+        output = _manual_backup_log_tail(job_id)
+        if _is_backup_busy(rc, output):
+            _manual_backup_failed(job_id, BACKUP_BUSY_MESSAGE)
+            return
+        incomplete_exit = rc == BACKUP_INCOMPLETE_RC and archive.is_file()
+        if (rc != 0 and not incomplete_exit) or not archive.is_file():
+            _manual_backup_failed(job_id, f"Hermes backup failed (exit {rc}). Check deployment logs and try again.")
+            return
+
+        _manual_backup_job_update(job_id, phase="verifying")
+        def verify_archive() -> None:
+            with zipfile.ZipFile(archive) as zf:
+                if zf.testzip() is not None:
+                    raise ValueError("Archive contains a damaged member")
+        try:
+            await asyncio.to_thread(verify_archive)
+        except Exception:
+            _manual_backup_failed(job_id, "Backup ZIP could not be read back. Nothing was offered for download.")
+            return
+
+        # Preserve the legacy endpoint's version hint and partial-backup checks.
+        try:
+            version = await _hermes_version()
+            def add_manifest() -> None:
+                with zipfile.ZipFile(archive, "a") as zf:
+                    zf.writestr("template_manifest.json", json.dumps({
+                        "hermes_version": version,
+                        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "template": "hermes-agent-railway-template",
+                    }))
+            await asyncio.to_thread(add_manifest)
+        except Exception as exc:
+            print(f"[backup-job] {job_id} manifest hint skipped: {exc}", flush=True)
+
+        warning_parts = []
+        if incomplete_exit:
+            warning_parts.append("Hermes reported that one or more files could not be included")
+        if reason := await asyncio.to_thread(_incomplete_backup_reason, archive):
+            warning_parts.append(reason)
+        phase, completed, total = _manual_backup_log_progress(job_id)
+        warning = "; ".join(warning_parts) or None
+        _manual_backup_job_update(
+            job_id, status="ready", phase="ready", finished_at=time.time(),
+            completed_files=total if total is not None else completed,
+            total_files=total, size_bytes=archive.stat().st_size, warning=warning,
+        )
+        print(f"[backup-job] {job_id} ready bytes={archive.stat().st_size} warning={bool(warning)}", flush=True)
+        try:
+            _manual_backup_jobs_reconcile(_manual_backup_jobs_read())
+        except (OSError, ValueError) as exc:
+            print(f"[backup-job] cleanup after {job_id} failed: {exc}", flush=True)
+    except asyncio.CancelledError:
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        _manual_backup_failed(job_id, "Backup was interrupted by a service restart. Create another backup.")
+        raise
+    except Exception as exc:
+        _manual_backup_failed(job_id, f"Could not finish backup: {exc}")
+    finally:
+        _manual_backup_active_id = None
+        _manual_backup_task = None
+        backup_lock.release()
+
+
+async def api_backup_jobs_get(request: Request) -> Response:
+    if err := guard(request): return err
+    try:
+        jobs = _manual_backup_jobs_reconcile(_manual_backup_jobs_read())
+        return JSONResponse({"jobs": [_manual_backup_job_public(job) for job in jobs]},
+                            headers={"Cache-Control": "private, no-store"})
+    except (OSError, ValueError) as exc:
+        return JSONResponse({"error": f"Could not inspect backup jobs: {exc}"}, status_code=500)
+
+
+async def api_backup_jobs_start(request: Request) -> Response:
+    global _manual_backup_active_id, _manual_backup_task
+    if err := guard(request): return err
+    async with _manual_backup_start_lock:
+        try:
+            jobs = _manual_backup_jobs_reconcile(_manual_backup_jobs_read())
+            active = next((job for job in jobs if job["status"] == "running"), None)
+            if active is not None:
+                return JSONResponse({"job": _manual_backup_job_public(active)}, status_code=202,
+                                    headers={"Cache-Control": "private, no-store"})
+            if backup_lock.locked():
+                return JSONResponse({"error": "A backup or restore is already in progress"}, status_code=409)
+            await backup_lock.acquire()
+            job_id = None
+            try:
+                job_id = secrets.token_hex(12)
+                _manual_backup_prepare_dir(job_id)
+                job = {"id": job_id, "status": "running", "phase": "preparing",
+                       "started_at": time.time(), "finished_at": None,
+                       "size_bytes": None, "warning": None, "error": None}
+                jobs.insert(0, job)
+                _manual_backup_jobs_write(jobs)
+                _manual_backup_active_id = job_id
+                _manual_backup_task = asyncio.create_task(_manual_backup_run(job_id))
+            except Exception:
+                _manual_backup_active_id = None
+                _manual_backup_task = None
+                try:
+                    if job_id is not None:
+                        _manual_backup_remove_artifact(job_id)
+                except (OSError, ValueError) as exc:
+                    print(f"[backup-job] could not clean failed start: {exc}", flush=True)
+                finally:
+                    backup_lock.release()
+                raise
+            return JSONResponse({"job": _manual_backup_job_public(job)}, status_code=202,
+                                headers={"Cache-Control": "private, no-store"})
+        except (OSError, ValueError) as exc:
+            return JSONResponse({"error": f"Could not start backup: {exc}"}, status_code=500)
+
+
+async def api_backup_job_download(request: Request) -> Response:
+    if err := guard(request): return err
+    job_id = request.path_params.get("job_id", "")
+    if not MANUAL_BACKUP_ID_RE.fullmatch(job_id):
+        return JSONResponse({"error": "Invalid backup job ID"}, status_code=404)
+    try:
+        jobs = _manual_backup_jobs_reconcile(_manual_backup_jobs_read())
+        job = next((item for item in jobs if item["id"] == job_id), None)
+        if job is None:
+            return JSONResponse({"error": "Backup job not found"}, status_code=404)
+        if job["status"] != "ready":
+            return JSONResponse({"error": "Backup is not available for download; check its status."}, status_code=409)
+        directory, archive, _ = _manual_backup_paths(job_id)
+        if directory.is_symlink() or not stat.S_ISREG(archive.lstat().st_mode):
+            raise ValueError("Backup archive is not a regular file")
+        headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
+        if job.get("warning"):
+            headers["X-Backup-Warning"] = "Backup is incomplete: " + str(job["warning"])[:500]
+        _manual_backup_downloads.add(job_id)
+        return FileResponse(
+            archive, filename=f"hermes-backup-{int(job['started_at'])}.zip",
+            media_type="application/zip", headers=headers,
+            background=BackgroundTask(_manual_backup_downloads.discard, job_id),
+        )
+    except (OSError, ValueError) as exc:
+        return JSONResponse({"error": f"Could not download backup: {exc}"}, status_code=500)
 
 
 async def api_backup_download(request: Request) -> Response:
@@ -3676,6 +4020,10 @@ async def auto_start():
 @asynccontextmanager
 async def lifespan(app):
     _sweep_stale_backup_tmpdirs()
+    try:
+        _manual_backup_jobs_reconcile(_manual_backup_jobs_read())
+    except (OSError, ValueError) as exc:
+        print(f"[backup-job] could not reconcile jobs at boot: {exc}", flush=True)
     # Strip .env keys that would make hermes shut its own dashboard down before
     # we spawn it — same "heal the volume before anything reads it" slot as the
     # pairing consolidation below.
@@ -3697,6 +4045,9 @@ async def lifespan(app):
     try:
         yield
     finally:
+        if _manual_backup_task is not None:
+            _manual_backup_task.cancel()
+            await asyncio.gather(_manual_backup_task, return_exceptions=True)
         await asyncio.gather(
             gw.stop(),
             dash.stop(),
@@ -3946,6 +4297,9 @@ routes = [
     Route("/setup/api/oauth/xai/start",         api_oauth_xai_start,  methods=["POST"]),
     Route("/setup/api/oauth/xai/status",        api_oauth_xai_status),
     Route("/setup/api/oauth/xai",               api_oauth_xai_delete, methods=["DELETE"]),
+    Route("/setup/api/backup/jobs",             api_backup_jobs_get, methods=["GET"]),
+    Route("/setup/api/backup/jobs",             api_backup_jobs_start, methods=["POST"]),
+    Route("/setup/api/backup/jobs/{job_id}/download", api_backup_job_download),
     Route("/setup/api/backup/download",         api_backup_download),
     Route("/setup/api/backup/restore",          api_backup_restore,  methods=["POST"]),
     Route("/setup/api/backup/snapshots",        api_backup_snapshots),
