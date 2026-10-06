@@ -1152,6 +1152,25 @@ def _has_xai_oauth_tokens() -> bool:
         return False
 
 
+def _has_codex_oauth_credential() -> bool:
+    """True when auth.json holds a ChatGPT/Codex subscription credential.
+
+    `hermes auth add openai-codex` (or `hermes model` → ChatGPT or Codex
+    Subscription) stores it in credential_pool["openai-codex"], not in .env,
+    so without this check is_config_complete() never sees a provider and
+    auto_start() leaves the gateway stopped after every redeploy.
+    """
+    auth_path = Path(HERMES_HOME) / "auth.json"
+    if not auth_path.exists():
+        return False
+    try:
+        data = json.loads(auth_path.read_text())
+        pool = data.get("credential_pool", {})
+        return bool(isinstance(pool, dict) and pool.get("openai-codex"))
+    except Exception:
+        return False
+
+
 def _save_xai_auth_json(tokens: dict) -> None:
     """Write xAI OAuth tokens to auth.json in hermes's expected format."""
     auth_path = Path(HERMES_HOME) / "auth.json"
@@ -1453,7 +1472,7 @@ def is_config_complete(data: dict[str, str] | None = None) -> bool:
     has_provider = any(
         _router_provider_is_configured(data, k) if k in MANAGED_ROUTER_PROVIDERS else bool(data.get(k))
         for k in PROVIDER_KEYS
-    ) or _has_xai_oauth_tokens()
+    ) or _has_xai_oauth_tokens() or _has_codex_oauth_credential()
     return has_model and has_provider
 
 
