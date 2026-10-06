@@ -11,6 +11,31 @@ release.
 
 ---
 
+## release/v2026.9.24/1 — October 6, 2026
+**Hermes v2026.9.24 · major (Hermes upgrade, from v2026.9.21)**
+
+### Hermes update
+- Hermes Agent **v2026.9.21 → v2026.9.24** (package 0.21.4 → 0.21.5); the native browser Chat now lets you choose a workspace for a new session.
+- **Hindsight is now a catalog plugin rather than a bundled memory provider.** This update does not delete saved settings or the memory bank. Setup shows affected deployments a notice to check each profile, install a missing plugin from the catalog, and test recall and retention. Embedded mode remains unavailable in the default root-running image.
+- **Hindsight users need a separate data backup for rollback or cloning.** The Hermes ZIP does not include external memory or embedded PostgreSQL under `/data/.pg0`; this limit predates the upgrade and is now called out in the Backup page.
+- **Bot Screen remains unavailable in this Railway image.** Browser Chat and its new workspace picker are available; the Desktop screen viewer needs a separate runtime and proxy integration.
+- **Old named-profile replies may need attention.** Hermes now records new outgoing replies in the root ledger; older unfinished replies remain in the named profile's ledger. Startup reports them and continues, so senders may need to make a new request; doing so can repeat tool actions. An unreadable ledger still stops the upgrade.
+- **Hand-written allowlists need full sender IDs.** A short entry such as `alice` no longer matches `alice@example.com`; users approved through the panel already have full IDs.
+
+### Changes to support upstream updates
+- **Existing root and named-profile configs run through Hermes' backed-up migration before startup.** Older profile instructions and the template's model setting are preserved if a migration fails; check warnings and confirm an old MCP server marked disabled now stays off under Hermes' current setting.
+- **Restore refuses an incomplete safety snapshot.** Databases in different profiles are checked by their full paths, so a same-named root database cannot hide a missing profile database.
+
+### Bug fixes
+- **Large manual backups now run as visible background jobs.** Create one from Backup & Restore, watch its phase and file count, and download the prepared ZIP in a separate request. The job and its outcome remain visible after a page reload. Prepared downloads remain available for 6 hours while the container stays up; a restart clearly marks an interrupted or unavailable job so it can be retried.
+- **Backup entries can be removed individually.** Remove clears an expired or failed entry; removing a ready backup also deletes its prepared ZIP after confirmation. A running backup or active download is protected.
+- **Unreadable config is preserved.** Save, gateway start, and xAI OAuth now report a config error instead of replacing the saved file with an empty one.
+- **Pairing approvals survive legacy folder aliases and interrupted writes.** Revoke warns when another access rule may still grant access, instead of claiming the user was blocked.
+- **Status now flags detected chat-history storage problems; Dashboard Stop stays stopped, and planned Restarts no longer count as crashes.**
+- **Runtime setup warnings now explain what survives redeploy.** Hermes packages installed on `/data` persist; provider-specific installers may still need to be run again.
+
+---
+
 ## release/v2026.9.21/1 — September 23, 2026
 **Hermes v2026.9.21 · major (Hermes upgrade, from v2026.9.11)**
 

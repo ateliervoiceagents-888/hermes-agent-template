@@ -1,4 +1,4 @@
-# Hermes v2026.9.21 requires a SQLite build without the upstream WAL-reset
+# Hermes v2026.9.21 introduced a SQLite build without the upstream WAL-reset
 # corruption bug. Debian Bookworm's 3.40.1 is affected and also makes Hermes'
 # new FTS write-health probe fail with a generic "SQL logic error" on every
 # freshly-created state.db. Build the same pinned SQLite release and feature
@@ -69,7 +69,7 @@ db.close()"
 # newest tag (format `vYYYY.M.D`, optionally with a `.PATCH` suffix, e.g.
 # `v2026.5.29.2`) and update the default below. Use `main` only if you accept
 # that every rebuild can pull arbitrary new upstream commits.
-ARG HERMES_REF=v2026.9.21
+ARG HERMES_REF=v2026.9.24
 
 # Persist the build arg into the runtime env so the admin UI can display which
 # Hermes release this image actually pins. Reading it (rather than hardcoding a
@@ -111,6 +111,9 @@ RUN apt-get update && \
 # moved into core deps — so it resolves to a no-op; kept for back-compat.
 # When bumping HERMES_REF, re-check hermes-agent's pyproject.toml [all] and
 # the extras below against the new release's pyproject.toml.
+# v2026.9.24 moved Hindsight out of the bundled provider/extras into its
+# plugin catalog. Do not request the retired [hindsight] extra or bake its old
+# hindsight-client==0.6.1 ahead of the catalog plugin's newer dependency.
 #
 # The `-e` is LOAD-BEARING since v2026.8.3: upstream's new setup.py raises on
 # bdist_wheel/sdist unless HERMES_NIX_BUILD=1. PEP 660 editable installs route
@@ -131,7 +134,7 @@ RUN apt-get update && \
 # bump — it tracks whatever nemo-relay pin the pinned tag carries.
 RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/hermes-agent.git /opt/hermes-agent && \
     cd /opt/hermes-agent && \
-    uv pip install --system --no-cache -e ".[all,messaging,tts-premium,honcho,bedrock,anthropic,edge-tts,hindsight,vision]" && \
+    uv pip install --system --no-cache -e ".[all,messaging,tts-premium,honcho,bedrock,anthropic,edge-tts,vision]" && \
     cd /opt/hermes-agent/web && \
     npm install --silent && \
     npm run build && \
@@ -190,6 +193,8 @@ RUN uv pip install --system --no-cache -r /app/requirements.txt
 RUN mkdir -p /data/.hermes
 
 COPY server.py /app/server.py
+COPY migrate_hermes_configs.py /app/migrate_hermes_configs.py
+COPY check_pending_deliveries.py /app/check_pending_deliveries.py
 COPY templates/ /app/templates/
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
